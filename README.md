@@ -5,6 +5,10 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 ## Files
 
 - `hs300_trend_rotation_bigqmt.py`: QMT strategy source with `init(C)` and `handlebar(C)` entry points.
+- `backtest_hs300_trend_rotation.py`: reproducible public-data backtest script.
+- `backtest_summary.json`: latest backtest summary.
+- `backtest_equity_curve.csv`: latest backtest equity curve.
+- `backtest_trades.csv`: latest backtest trade log.
 
 ## Strategy Summary
 
@@ -25,3 +29,7 @@ Before enabling live trading:
 3. Change `LIVE_TRADING = True` only after validation.
 
 This project is for strategy research and execution testing only. It is not investment advice or a promise of returns.
+
+## Backtest Limitation
+
+The included backtest uses current HS300 constituents across the full historical window, so it has survivorship bias. Treat it as an approximate strategy sanity check rather than a fully point-in-time index constituent backtest.

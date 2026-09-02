@@ -1,0 +1,16 @@
+{
+  "start": "2021-09-02",
+  "end": "2026-09-01",
+  "initial_equity": 1000000.0,
+  "final_equity": 1508241.367569999,
+  "total_return": 0.508241367569999,
+  "annual_return": 0.08572194922783849,
+  "max_drawdown": -0.5240970684382822,
+  "sharpe": 0.42031264960023773,
+  "trade_count": 1278,
+  "benchmark_total_return": -0.05297767080611415,
+  "benchmark_annual_return": -0.010834853478625894,
+  "benchmark_max_drawdown": -0.37856524646917666,
+  "constituents": 288,
+  "usable_symbols": 286
+}
