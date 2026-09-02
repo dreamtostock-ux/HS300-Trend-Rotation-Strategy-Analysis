@@ -28,6 +28,8 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 
 `LIVE_TRADING = False` by default. In this mode, the strategy only logs intended orders and does not call live trading orders.
 
+The default execution window is 14:50:00 to 14:56:50. The strategy exits before 14:57:00 to avoid the A-share closing call auction.
+
 Before enabling live trading:
 
 1. Run it in big-QMT simulation/log-only mode.

@@ -55,9 +55,10 @@ DAILY_BAR_COUNT = max(MA_LONG + LONG_SLOPE_LOOKBACK, MOMENTUM_PERIOD + 1) + 10
 # Only start trading signals on or after this date.
 TRADE_START = "20220701"
 
-# Intraday execution gate. If using daily bars, keep a late-afternoon window.
+# Intraday execution gate. Avoid the A-share closing call auction after 14:57.
 EXECUTE_AFTER = "145000"
-EXECUTE_BEFORE = "150000"
+EXECUTE_BEFORE = "145650"
+CLOSING_AUCTION_START = "145700"
 
 # Order settings. QMT passorder: 23=buy, 24=sell, 1101=share amount, 11=limit.
 BUY_PRICE_BUFFER = 0.002
@@ -1037,6 +1038,8 @@ def handlebar(C):
     if datetime.now().weekday() > 4:
         return
     hhmmss = now_hhmmss()
+    if hhmmss >= CLOSING_AUCTION_START:
+        return
     if hhmmss < EXECUTE_AFTER or hhmmss > EXECUTE_BEFORE:
         return
     if daily_already_processed(current_date):
