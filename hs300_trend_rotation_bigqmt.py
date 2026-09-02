@@ -35,6 +35,7 @@ LIVE_TRADING = False
 
 SECTOR_NAME = "沪深300"
 SECTOR_ALIASES = ["沪深300", "沪深300成份股", "沪深300成分股"]
+FALLBACK_CONSTITUENTS_FILE = "hs300_constituents.csv"
 BENCHMARK_CODE = "000300.SH"
 
 MAX_POSITIONS = 5
@@ -96,6 +97,7 @@ S = {
     "live": None,
     "last_processed_date": "",
     "last_rebalance_date": "",
+    "last_no_constituents_date": "",
     "trade_dates": [],
     "market_ok_streak": 0,
     "market_weak_streak": 0,
@@ -272,7 +274,45 @@ def get_hs300_codes(C):
         value = normalize_stock_code(str(code))
         if value and value not in result:
             result.append(value)
+    if not result:
+        result = load_fallback_constituents()
     return result
+
+
+def load_fallback_constituents():
+    candidates = [
+        os.path.join(os.getcwd(), FALLBACK_CONSTITUENTS_FILE),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), FALLBACK_CONSTITUENTS_FILE),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        result = []
+        try:
+            with open(path, "r") as handle:
+                for line in handle:
+                    value = line.strip()
+                    if not value or value.lower() == "code":
+                        continue
+                    code = normalize_stock_code(value)
+                    if code and code not in result:
+                        result.append(code)
+            if result:
+                log("QMT sector query returned empty; loaded {} HS300 codes from {}".format(
+                    len(result), path))
+                return result
+        except Exception as exc:
+            log("fallback constituents load failed: {} {}".format(path, exc))
+    return []
+
+
+def no_constituents_logged(current_date):
+    return S.get("last_no_constituents_date") == current_date
+
+
+def mark_no_constituents_logged(current_date):
+    S["last_no_constituents_date"] = current_date
+    save_state()
 
 
 def normalize_stock_code(code):
@@ -801,7 +841,10 @@ def execute_strategy(C, account_id, current_date):
     remember_trade_date(current_date)
     all_codes = get_hs300_codes(C)
     if not all_codes:
-        log("BLOCKED: no HS300 constituents returned by QMT sector query")
+        if not no_constituents_logged(current_date):
+            log("BLOCKED: no HS300 constituents returned by QMT sector query and fallback file {}; copy this file into the strategy directory or confirm QMT sector name".format(
+                FALLBACK_CONSTITUENTS_FILE))
+            mark_no_constituents_logged(current_date)
         return
 
     try:

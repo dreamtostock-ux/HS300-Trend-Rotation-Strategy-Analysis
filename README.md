@@ -5,6 +5,7 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 ## Files
 
 - `hs300_trend_rotation_bigqmt.py`: QMT strategy source with `init(C)` and `handlebar(C)` entry points.
+- `hs300_constituents.csv`: fallback HS300 constituent list used when the QMT sector query returns empty.
 - `backtest_hs300_trend_rotation.py`: reproducible public-data backtest script.
 - `backtest_summary.json`: latest backtest summary.
 - `backtest_equity_curve.csv`: latest backtest equity curve.
@@ -21,6 +22,7 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 - Borrowed safety components: HS300 index market filter, ST/STAR-board buy filter, suspended/limit-up/limit-down buy avoidance, liquidity filter, state persistence, active-order checks, and account/position query failure protection.
 - Rebalance timing: based on recorded trading dates instead of a simple counter.
 - Logging: prints candidate counts, blocked-buy reasons, top rankings, targets, and position drift.
+- Sector fallback: if QMT does not return the HS300 sector list near the close, the strategy loads `hs300_constituents.csv` from the strategy directory.
 
 ## Safety
 
