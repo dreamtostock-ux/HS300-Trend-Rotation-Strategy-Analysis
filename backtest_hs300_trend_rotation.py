@@ -2,15 +2,16 @@
 """Backtest the HS300 trend rotation strategy with public A-share data.
 
 Data source:
-- Current HS300 constituents: AkShare index_stock_cons.
+- Point-in-time HS300 constituents: BaoStock snapshots sampled every 20
+  trading days and forward-filled without look-ahead.
 - A-share daily OHLC: AkShare Tencent endpoint stock_zh_a_hist_tx, qfq.
 - HS300 benchmark: AkShare Tencent endpoint stock_zh_index_daily_tx.
 
 Important limitation:
-This uses current HS300 constituents for the full lookback, matching the
-prototype's note and big-QMT implementation. It therefore has survivorship
-bias and should be treated as an approximate execution sanity check, not a
-strict historical constituent backtest.
+Public snapshots are sampled rather than queried for every trading day, so
+index additions and removals can be reflected up to 20 trading days late.
+The result remains an approximate research backtest rather than broker-grade
+tick-level execution simulation.
 """
 
 from __future__ import annotations
@@ -30,6 +31,9 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / ".cache" / "akshare_tx"
 CACHE.mkdir(parents=True, exist_ok=True)
+MEMBERSHIP_CACHE = ROOT / ".cache" / "hs300_membership_daily_v2.csv"
+MEMBERSHIP_SNAPSHOT_CACHE = ROOT / ".cache" / "hs300_membership_snapshots_v2.csv"
+MEMBERSHIP_SNAPSHOT_DAYS = 20
 
 START_DATE = "20200701"      # warm-up for MA250 before the 5-year test window
 TRADE_START = "20210902"
@@ -58,6 +62,7 @@ LIMIT_UP_THRESHOLD = 0.09
 LIMIT_DOWN_THRESHOLD = 0.09
 AMOUNT_LOOKBACK = 20
 MIN_AVG_AMOUNT = 20000000.0
+MIN_PRICE_ROWS = MA_LONG + LONG_SLOPE_LOOKBACK
 
 COMMISSION = 0.0003
 MIN_COMMISSION = 5.0
@@ -73,7 +78,9 @@ class Order:
 
 
 def normalize_code(code: str) -> str:
-    raw = str(code).strip()
+    raw = str(code).strip().lower().replace(".", "")
+    if raw.startswith(("sh", "sz")) and len(raw) >= 8:
+        return raw[:2] + raw[-6:]
     if raw.startswith(("6", "5", "9")):
         return "sh" + raw
     return "sz" + raw
@@ -114,38 +121,133 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def fetch_constituents() -> list[str]:
-    df = ak.index_stock_cons(symbol="000300")
-    code_col = df.columns[0]
-    codes = [normalize_code(x) for x in df[code_col].astype(str)]
-    return sorted(set(codes))
+def fetch_historical_membership(trade_dates, refresh: bool = False) -> dict[pd.Timestamp, set[str]]:
+    """Load point-in-time HS300 snapshots and forward-fill without look-ahead."""
+    wanted = sorted(set(pd.Timestamp(value).normalize() for value in trade_dates))
+    if not wanted:
+        return {}
+    if MEMBERSHIP_CACHE.exists() and not refresh:
+        cached = pd.read_csv(MEMBERSHIP_CACHE, dtype={"code": str})
+        cached["date"] = pd.to_datetime(cached["date"])
+        cached["code"] = cached["code"].map(normalize_code)
+        by_date = {
+            pd.Timestamp(date).normalize(): set(group["code"])
+            for date, group in cached.groupby("date")
+        }
+        if all(date in by_date for date in wanted):
+            return dict((date, by_date[date]) for date in wanted)
+
+    anchor_indexes = list(range(0, len(wanted), MEMBERSHIP_SNAPSHOT_DAYS))
+    if anchor_indexes[-1] != len(wanted) - 1:
+        anchor_indexes.append(len(wanted) - 1)
+    anchors = [wanted[index] for index in anchor_indexes]
+    snapshots = {}
+    if MEMBERSHIP_SNAPSHOT_CACHE.exists() and not refresh:
+        frame = pd.read_csv(MEMBERSHIP_SNAPSHOT_CACHE, dtype={"code": str})
+        frame["date"] = pd.to_datetime(frame["date"])
+        frame["code"] = frame["code"].map(normalize_code)
+        snapshots = {
+            pd.Timestamp(date).normalize(): set(group["code"])
+            for date, group in frame.groupby("date")
+        }
+
+    missing = [date for date in anchors if date not in snapshots]
+    if missing:
+        try:
+            import baostock as bs
+        except ImportError as exc:
+            raise RuntimeError(
+                "Point-in-time constituents require baostock; run pip install baostock"
+            ) from exc
+        login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError("BaoStock login failed: {}".format(login.error_msg))
+        try:
+            for idx, date in enumerate(missing, 1):
+                query = bs.query_hs300_stocks(date=date.strftime("%Y-%m-%d"))
+                if query.error_code != "0":
+                    raise RuntimeError(
+                        "BaoStock HS300 query failed for {}: {}".format(
+                            date.date(), query.error_msg))
+                fields = list(query.fields)
+                code_idx = fields.index("code")
+                members = set()
+                while query.next():
+                    members.add(normalize_code(query.get_row_data()[code_idx]))
+                if not members:
+                    raise RuntimeError("BaoStock returned no HS300 members for {}".format(
+                        date.date()))
+                snapshots[date] = members
+                if idx % 10 == 0 or idx == len(missing):
+                    rows = [
+                        {"date": snap_date, "code": code}
+                        for snap_date in sorted(snapshots)
+                        for code in sorted(snapshots[snap_date])
+                    ]
+                    pd.DataFrame(rows).to_csv(MEMBERSHIP_SNAPSHOT_CACHE, index=False)
+                    print("membership snapshots {}/{} queried".format(idx, len(missing)))
+        finally:
+            bs.logout()
+
+    by_date = {}
+    current = None
+    for idx, date in enumerate(wanted):
+        if idx in anchor_indexes:
+            current = snapshots[date]
+        by_date[date] = set(current)
+    rows = [
+        {"date": date, "code": code}
+        for date in wanted
+        for code in sorted(by_date[date])
+    ]
+    pd.DataFrame(rows).to_csv(MEMBERSHIP_CACHE, index=False)
+    print("membership {} dates cached from {} historical snapshots".format(
+        len(wanted), len(anchors)))
+    return by_date
 
 
 def fetch_one(code: str, refresh: bool = False) -> tuple[str, pd.DataFrame | None, str]:
-    path = CACHE / f"{code}_{START_DATE}_{END_DATE}_em_qfq.csv"
-    if path.exists() and not refresh:
-        try:
-            return code, clean_columns(pd.read_csv(path)), "cache"
-        except Exception:
-            pass
+    path = CACHE / f"{code}_{START_DATE}_{END_DATE}_tx_qfq.csv"
+    legacy_path = CACHE / f"{code}_{START_DATE}_{END_DATE}_em_qfq.csv"
+    if not refresh:
+        for cached_path in [path, legacy_path]:
+            if not cached_path.exists():
+                continue
+            try:
+                return code, clean_columns(pd.read_csv(cached_path)), "cache"
+            except Exception:
+                pass
     last_error = ""
-    for attempt in range(5):
+    for attempt in range(3):
         try:
-            df = ak.stock_zh_a_hist(
-                symbol=code[2:],
-                period="daily",
+            df = ak.stock_zh_a_hist_tx(
+                symbol=code,
                 start_date=START_DATE,
                 end_date=END_DATE,
                 adjust="qfq",
+                timeout=20,
             )
             df = clean_columns(df)
-            if len(df) < 300:
-                raise ValueError(f"too few rows: {len(df)}")
+            if len(df) < MIN_PRICE_ROWS:
+                return code, None, "insufficient history: {} < {}".format(
+                    len(df), MIN_PRICE_ROWS)
             df.to_csv(path, index=False)
-            return code, df, "net"
+            return code, df, "tencent"
         except Exception as exc:
             last_error = str(exc)
-            time.sleep(1.2 + attempt * 2.0)
+            time.sleep(0.8 + attempt)
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=code[2:], period="daily", start_date=START_DATE,
+            end_date=END_DATE, adjust="qfq")
+        df = clean_columns(df)
+        if len(df) < MIN_PRICE_ROWS:
+            return code, None, "insufficient history: {} < {}".format(
+                len(df), MIN_PRICE_ROWS)
+        df.to_csv(path, index=False)
+        return code, df, "eastmoney_fallback"
+    except Exception as exc:
+        last_error = "Tencent: {}; Eastmoney: {}".format(last_error, exc)
     return code, None, last_error
 
 
@@ -162,9 +264,12 @@ def load_price_data(codes: list[str]) -> dict[str, pd.DataFrame]:
                 out[code] = df
             if idx % 25 == 0 or idx == len(futures):
                 print(f"loaded {idx}/{len(futures)}; ok={len(out)} fail={len(failures)}")
+    fail_path = ROOT / "backtest_data_failures.json"
+    fail_path.write_text(
+        json.dumps(failures, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     if failures:
-        fail_path = ROOT / "backtest_data_failures.json"
-        fail_path.write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"failures written to {fail_path}")
     return out
 
@@ -220,6 +325,8 @@ def is_star_market(code: str) -> bool:
 
 
 def buy_block_reason(record: dict) -> str:
+    if record.get("close", 0.0) < record.get("ma60", 0.0):
+        return "below_ma60"
     if FILTER_SUSPENDED_BUYS and record.get("volume", 0.0) <= 0:
         return "suspended_or_zero_volume"
     prev_close = record.get("prev_close")
@@ -258,7 +365,22 @@ def floor_lot(value: float) -> int:
     return int(math.floor(value / LOT_SIZE) * LOT_SIZE)
 
 
-def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def select_target_codes(rows: list[dict], held_codes) -> list[str]:
+    ranked_codes = [row["code"] for row in rows]
+    exit_buffer = set(ranked_codes[:EXIT_RANK])
+    held = set(held_codes)
+    targets = [code for code in ranked_codes if code in held and code in exit_buffer]
+    targets = targets[:MAX_POSITIONS]
+    for code in ranked_codes[:ENTRY_RANK]:
+        if len(targets) >= MAX_POSITIONS:
+            break
+        if code not in targets:
+            targets.append(code)
+    return targets
+
+
+def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame,
+             membership_by_date: dict[pd.Timestamp, set[str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     enriched = {code: enrich(df) for code, df in data.items()}
     benchmark_enriched = enrich_benchmark(benchmark)
     calendars = sorted(set().union(*(set(df.index) for df in enriched.values())))
@@ -295,8 +417,9 @@ def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame) -> tuple[pd
             else:
                 held = positions.get(order.code, 0)
                 sell_shares = min(abs(shares), held)
-                sell_shares = floor_lot(sell_shares)
-                if sell_shares < LOT_SIZE:
+                if sell_shares < held:
+                    sell_shares = floor_lot(sell_shares)
+                if sell_shares <= 0:
                     continue
                 shares = -sell_shares
                 cost = commission(shares, price)
@@ -328,6 +451,9 @@ def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame) -> tuple[pd
         rows = []
         all_rows = {}
         blocked_counts: dict[str, int] = {}
+        members = membership_by_date.get(pd.Timestamp(date).normalize())
+        if members is None:
+            raise RuntimeError("Missing point-in-time HS300 membership for {}".format(date))
         for code, df in enriched.items():
             if date not in df.index:
                 continue
@@ -346,6 +472,8 @@ def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame) -> tuple[pd
                 "momentum60": float(row["momentum60"]),
             }
             all_rows[code] = record
+            if code not in members:
+                continue
             if not record["eligible"]:
                 continue
             if FILTER_STAR_MARKET and is_star_market(code):
@@ -382,10 +510,10 @@ def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame) -> tuple[pd
         )
         if rebalanced:
             last_rebalance_idx = trade_idx
-            exit_buffer = {r["code"] for r in rows[:EXIT_RANK]}
-            targets = [r["code"] for r in rows[:ENTRY_RANK]][:MAX_POSITIONS]
+            targets = select_target_codes(rows, positions.keys())
+            target_set = set(targets)
             for code, shares in list(positions.items()):
-                if code not in exit_buffer and code not in order_codes:
+                if code not in target_set and code not in order_codes:
                     pending.append(Order(code, -shares))
                     order_codes.add(code)
 
@@ -459,21 +587,26 @@ def calc_stats(equity: pd.DataFrame, benchmark: pd.DataFrame) -> dict:
 
 
 def main():
-    codes = fetch_constituents()
-    print(f"constituents={len(codes)}")
+    benchmark = clean_columns(ak.stock_zh_index_daily_tx(symbol="sh000300"))
+    membership_dates = benchmark.loc[
+        (benchmark["date"] >= pd.Timestamp(TRADE_START)) &
+        (benchmark["date"] <= pd.Timestamp(END_DATE)), "date"]
+    membership = fetch_historical_membership(membership_dates)
+    codes = sorted(set().union(*membership.values()))
+    print(f"historical_constituents={len(codes)}")
     data = load_price_data(codes)
     print(f"usable_symbols={len(data)}")
-    benchmark = clean_columns(ak.stock_zh_index_daily_tx(symbol="sh000300"))
-    equity, trades = backtest(data, benchmark)
+    equity, trades = backtest(data, benchmark, membership)
     stats = calc_stats(equity, benchmark)
     stats["trade_count"] = int(len(trades))
     stats["constituents"] = len(codes)
     stats["usable_symbols"] = len(data)
+    stats["constituent_mode"] = "point_in_time_baostock_20day_snapshots"
 
     equity.to_csv(ROOT / "backtest_equity_curve.csv", encoding="utf-8-sig")
     trades.to_csv(ROOT / "backtest_trades.csv", index=False, encoding="utf-8-sig")
     (ROOT / "backtest_summary.json").write_text(
-        json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 

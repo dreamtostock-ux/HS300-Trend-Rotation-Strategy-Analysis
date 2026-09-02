@@ -31,9 +31,13 @@ def set_params(params: dict) -> None:
 
 
 def main() -> None:
-    codes = bt.fetch_constituents()
-    data = bt.load_price_data(codes)
     benchmark = bt.clean_columns(ak.stock_zh_index_daily_tx(symbol="sh000300"))
+    membership_dates = benchmark.loc[
+        (benchmark["date"] >= pd.Timestamp(bt.TRADE_START)) &
+        (benchmark["date"] <= pd.Timestamp(bt.END_DATE)), "date"]
+    membership = bt.fetch_historical_membership(membership_dates)
+    codes = sorted(set().union(*membership.values()))
+    data = bt.load_price_data(codes)
 
     keys = list(GRID.keys())
     rows = []
@@ -42,7 +46,7 @@ def main() -> None:
         if params["EXIT_RANK"] < params["ENTRY_RANK"]:
             continue
         set_params(params)
-        equity, trades = bt.backtest(data, benchmark)
+        equity, trades = bt.backtest(data, benchmark, membership)
         stats = bt.calc_stats(equity, benchmark)
         stats["trade_count"] = int(len(trades))
         stats["params"] = json.dumps(params, sort_keys=True)

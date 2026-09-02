@@ -13,8 +13,8 @@ Safety:
 - LIVE_TRADING is False by default. It logs intended orders only.
 - State is persisted per account to avoid duplicate daily rebalances after a
   QMT restart.
-- It is intended to run on a 1-minute or daily strategy chart. The logic gates
-  by time and date, so repeated handlebar calls on the same day are harmless.
+- It can run on a 1-minute or daily strategy chart. Live mode gates by wall
+  clock; QMT backtest mode uses each bar's own timestamp.
 """
 
 import json
@@ -33,9 +33,16 @@ ACCOUNT_ID = ""
 # False = signal log only. True = send real passorder orders.
 LIVE_TRADING = False
 
+# False for model trading. Set True only inside QMT historical backtests.
+# Historical mode uses bar timestamps, skips the intraday gate, keeps state in
+# memory, and uses quickTrade=2 for historical bars.
+QMT_BACKTEST_MODE = False
+
 SECTOR_NAME = "沪深300"
 SECTOR_ALIASES = ["沪深300", "沪深300成份股", "沪深300成分股"]
 FALLBACK_CONSTITUENTS_FILE = "hs300_constituents.csv"
+# Optional absolute path. Leave empty to search working/script directories.
+FALLBACK_CONSTITUENTS_PATH = ""
 BENCHMARK_CODE = "000300.SH"
 
 MAX_POSITIONS = 5
@@ -67,6 +74,8 @@ PRICE_TICK = 0.01
 PRICE_DECIMALS = 2
 LOT_SIZE = 100
 CASH_BUFFER = 0.01
+ACTIVE_ORDER_STATUSES = set([48, 49, 50, 51, 52, 55, 86, 255])
+RETRYABLE_TERMINAL_STATUSES = set([53, 54, 57])
 
 # Optional hard guard. 0 means no cap other than account cash.
 MAX_BUY_VALUE_PER_STOCK = 0.0
@@ -92,18 +101,25 @@ STATE_FILE = ""
 
 # ========================= RUNTIME STATE =========================
 
-S = {
-    "schema_version": 1,
-    "account": "",
-    "live": None,
-    "last_processed_date": "",
-    "last_rebalance_date": "",
-    "last_no_constituents_date": "",
-    "trade_dates": [],
-    "market_ok_streak": 0,
-    "market_weak_streak": 0,
-    "attempts": {},        # {yyyymmdd: [remark, ...]}
-}
+def new_state():
+    return {
+        "schema_version": 2,
+        "account": "",
+        "live": None,
+        "last_processed_date": "",
+        "last_rebalance_date": "",
+        "last_no_constituents_date": "",
+        "trade_dates": [],
+        "market_ok_streak": 0,
+        "market_weak_streak": 0,
+        "attempts": {},        # {yyyymmdd: [remark, ...]}
+        "managed_codes": [],
+        "pending_rebalance_date": "",
+        "pending_targets": [],
+    }
+
+
+S = new_state()
 
 
 # ========================= SMALL UTILITIES =========================
@@ -122,6 +138,9 @@ def current_account_id():
 
 def configure_state_file(account_id):
     global STATE_FILE
+    if QMT_BACKTEST_MODE:
+        STATE_FILE = ""
+        return
     root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     path = os.path.join(root, STATE_DIR_NAME)
     if not os.path.isdir(path):
@@ -144,11 +163,17 @@ def load_state():
             data = json.load(handle)
         if isinstance(data, dict):
             S.update(data)
+            S["schema_version"] = 2
+            S.setdefault("managed_codes", [])
+            S.setdefault("pending_rebalance_date", "")
+            S.setdefault("pending_targets", [])
     except Exception as exc:
         log("WARNING: state load failed: {}".format(exc))
 
 
 def save_state():
+    if QMT_BACKTEST_MODE:
+        return True
     if not STATE_FILE:
         return False
     try:
@@ -177,6 +202,17 @@ def attr_number(obj, names, default=0.0):
         except Exception:
             continue
     return float(default)
+
+
+def attr_text(obj, names, default=""):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if value is not None and str(value):
+            return str(value)
+    return str(default)
 
 
 def full_code_from_record(record):
@@ -225,7 +261,9 @@ def buy_lot(value):
 
 
 def sell_lot(value):
-    return max(0, int(math.floor(float(value) / LOT_SIZE)) * LOT_SIZE)
+    # A-share odd lots created by corporate actions can be sold only as one
+    # complete remainder. Exit orders therefore use every available share.
+    return max(0, int(float(value)))
 
 
 def is_valid_number(value):
@@ -235,12 +273,25 @@ def is_valid_number(value):
         return False
 
 
-def today_text():
-    return datetime.now().strftime("%Y%m%d")
-
-
-def now_hhmmss():
-    return datetime.now().strftime("%H%M%S")
+def context_datetime(C):
+    if not QMT_BACKTEST_MODE:
+        return datetime.now()
+    try:
+        value = C.get_bar_timetag(C.barpos)
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 100000000000.0:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp)
+        text = str(value or "").strip()
+        for fmt in ["%Y%m%d%H%M%S", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
+            try:
+                return datetime.strptime(text[:len(datetime.now().strftime(fmt))], fmt)
+            except Exception:
+                continue
+    except Exception as exc:
+        raise RuntimeError("QMT bar timestamp is unavailable in backtest mode: {}".format(exc))
+    raise RuntimeError("QMT bar timestamp is invalid in backtest mode")
 
 
 # ========================= QMT DATA ADAPTERS =========================
@@ -281,11 +332,20 @@ def get_hs300_codes(C):
 
 
 def load_fallback_constituents():
-    candidates = [
-        os.path.join(os.getcwd(), FALLBACK_CONSTITUENTS_FILE),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), FALLBACK_CONSTITUENTS_FILE),
-    ]
+    candidates = []
+    if FALLBACK_CONSTITUENTS_PATH:
+        candidates.append(os.path.abspath(FALLBACK_CONSTITUENTS_PATH))
+    candidates.append(os.path.join(os.getcwd(), FALLBACK_CONSTITUENTS_FILE))
+    script_file = globals().get("__file__", "")
+    if script_file:
+        candidates.append(os.path.join(
+            os.path.dirname(os.path.abspath(script_file)), FALLBACK_CONSTITUENTS_FILE))
+    checked = set()
     for path in candidates:
+        path = os.path.normcase(os.path.abspath(path))
+        if path in checked:
+            continue
+        checked.add(path)
         if not os.path.exists(path):
             continue
         result = []
@@ -488,28 +548,39 @@ def safe_position_map(account_id):
         return {}, False
 
 
-def has_active_order(account_id, stock_code):
+def strategy_orders(account_id):
     try:
-        orders = qmt_detail(account_id, "order") or []
+        return qmt_detail(account_id, "order", STRATEGY_NAME) or []
     except Exception as exc:
-        log("order query failed for {}; skip to avoid duplicate: {}".format(stock_code, exc))
-        return True
+        log("strategy order query failed; block new orders: {}".format(exc))
+        return None
+
+
+def active_order_codes(account_id):
+    orders = strategy_orders(account_id)
+    if orders is None:
+        return None
+    result = set()
     for order in orders:
         code = full_code_from_record(order)
-        if not same_code(code, stock_code):
+        if not code:
             continue
         status = int(attr_number(order, ["m_nOrderStatus"], -1))
-        # QMT terminal statuses seen in practice:
-        # 53=part-canceled, 54=canceled, 56=filled, 57=rejected/junk.
-        if status in [53, 54, 56, 57]:
-            continue
         requested = int(attr_number(
             order, ["m_nVolumeTotalOriginal", "m_nVolume", "m_nOrderVolume"], 0))
         traded = int(attr_number(order, ["m_nVolumeTraded", "m_nTradedVolume"], 0))
         left = int(attr_number(order, ["m_nVolumeLeft", "m_nVolumeTotal"], 0))
-        if max(left, requested - traded) > 0:
-            return True
-    return False
+        if status in ACTIVE_ORDER_STATUSES or (
+                status not in [53, 54, 56, 57] and max(left, requested - traded) > 0):
+            result.add(code)
+    return result
+
+
+def has_active_order(account_id, stock_code, known_active=None):
+    active = known_active if known_active is not None else active_order_codes(account_id)
+    if active is None:
+        return True
+    return any(same_code(code, stock_code) for code in active)
 
 
 # ========================= SIGNAL LOGIC =========================
@@ -687,6 +758,8 @@ def build_rankings(close_history):
 
 
 def buy_block_reason(row):
+    if row.get("close", 0.0) < row.get("ma60", 0.0):
+        return "below_ma60"
     if FILTER_SUSPENDED_BUYS and row.get("volume", 0.0) <= 0:
         return "suspended_or_zero_volume"
     prev = float(row.get("prev_close", 0.0) or 0.0)
@@ -751,6 +824,72 @@ def value_by_code(mapping, code, default=None):
     return default
 
 
+def unique_codes(codes):
+    result = []
+    for code in codes or []:
+        value = normalize_stock_code(code)
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def managed_position_codes(positions, current_constituents):
+    managed = set(unique_codes(S.get("managed_codes", [])))
+    constituents = set(unique_codes(current_constituents))
+    position_codes = set(unique_codes(positions.keys()))
+
+    # Preserve the previous version's ownership assumption for existing HS300
+    # positions, then remember them if they later leave the index.
+    managed.update(position_codes.intersection(constituents))
+    pending = set(unique_codes(S.get("pending_targets", [])))
+    managed.intersection_update(position_codes.union(pending))
+    S["managed_codes"] = sorted(managed)
+    save_state()
+    return sorted(managed.intersection(position_codes))
+
+
+def remember_managed_code(code):
+    values = set(unique_codes(S.get("managed_codes", [])))
+    values.add(normalize_stock_code(code))
+    S["managed_codes"] = sorted(value for value in values if value)
+    save_state()
+
+
+def select_target_codes(ranked, held_codes):
+    ranked_codes = [normalize_stock_code(row["code"]) for row in ranked]
+    exit_buffer = set(ranked_codes[:EXIT_RANK])
+    held = set(unique_codes(held_codes))
+
+    # Hysteresis: keep the best currently held names inside EXIT_RANK, but
+    # never let retained names plus new entries exceed MAX_POSITIONS.
+    targets = [code for code in ranked_codes if code in held and code in exit_buffer]
+    targets = targets[:MAX_POSITIONS]
+    for code in ranked_codes[:ENTRY_RANK]:
+        if len(targets) >= MAX_POSITIONS:
+            break
+        if code not in targets:
+            targets.append(code)
+    return targets
+
+
+def begin_pending_rebalance(current_date, target_codes):
+    S["pending_rebalance_date"] = current_date
+    S["pending_targets"] = unique_codes(target_codes)[:MAX_POSITIONS]
+    save_state()
+
+
+def clear_pending_rebalance():
+    S["pending_rebalance_date"] = ""
+    S["pending_targets"] = []
+    save_state()
+
+
+def pending_targets(current_date):
+    if S.get("pending_rebalance_date") != current_date:
+        return []
+    return unique_codes(S.get("pending_targets", []))[:MAX_POSITIONS]
+
+
 def rebalance_due(current_date):
     if S.get("last_rebalance_date") == current_date:
         return False
@@ -777,8 +916,9 @@ def mark_rebalanced(current_date):
 # ========================= EXECUTION =========================
 
 def make_remark(current_date, code, side, volume):
-    return "{}_{}_{}_{}".format(
-        STRATEGY_NAME, side, code.split(".")[0], current_date)[-64:]
+    # QMT requires userOrderId/investment remarks shorter than 24 characters.
+    side_code = "B" if side == "BUY" else "S"
+    return "H3{}{}{}".format(current_date[-6:], side_code, code.split(".")[0])[:23]
 
 
 def attempt_recorded(current_date, remark):
@@ -798,11 +938,22 @@ def record_attempt(current_date, remark):
     return save_state()
 
 
-def submit_order(C, account_id, code, side, volume, reference_price, current_date):
+def forget_attempt(current_date, remark):
+    attempts = S.setdefault("attempts", {})
+    values = attempts.get(current_date, [])
+    if remark in values:
+        values.remove(remark)
+        if not values:
+            attempts.pop(current_date, None)
+        save_state()
+
+
+def submit_order(C, account_id, code, side, volume, reference_price, current_date,
+                 known_active=None):
     volume = int(volume)
-    if volume < LOT_SIZE:
+    if volume <= 0 or (side == "BUY" and volume < LOT_SIZE):
         return False
-    if has_active_order(account_id, code):
+    if has_active_order(account_id, code, known_active):
         log("SKIP {} {}: active order exists".format(side, code))
         return False
     if side == "BUY":
@@ -825,15 +976,21 @@ def submit_order(C, account_id, code, side, volume, reference_price, current_dat
     if not LIVE_TRADING:
         log("DRY RUN: {} {} shares of {} at {:.2f}; remark={}".format(
             side, volume, code, price, remark))
+        if side == "BUY":
+            remember_managed_code(code)
         return True
 
     try:
+        quick_trade = 2 if QMT_BACKTEST_MODE else 1
         passorder(op_type, 1101, account_id, code, 11, price,
-                  int(volume), STRATEGY_NAME, 1, remark, C)
+                  int(volume), STRATEGY_NAME, quick_trade, remark, C)
         log("ORDER SENT: {} {} shares of {} at {:.2f}; remark={}".format(
             side, volume, code, price, remark))
+        if side == "BUY":
+            remember_managed_code(code)
         return True
     except Exception as exc:
+        forget_attempt(current_date, remark)
         log("ORDER ERROR: {} {} failed: {}".format(side, code, exc))
         return False
 
@@ -848,62 +1005,71 @@ def execute_strategy(C, account_id, current_date):
             mark_no_constituents_logged(current_date)
         return
 
+    positions, positions_ok = safe_position_map(account_id)
+    if not positions_ok:
+        log("BLOCKED: position query failed; retry later without marking today complete")
+        return
+
+    managed_codes = managed_position_codes(positions, all_codes)
+    data_codes = unique_codes(all_codes + managed_codes)
     try:
-        C.set_universe([BENCHMARK_CODE] + all_codes)
+        C.set_universe([BENCHMARK_CODE] + data_codes)
     except Exception:
         pass
 
-    market_history = latest_market_map(C, [BENCHMARK_CODE] + all_codes)
+    market_history = latest_market_map(C, [BENCHMARK_CODE] + data_codes)
     index_history = value_by_code(market_history, BENCHMARK_CODE, {})
     index_closes = index_history.get("close", [])
     market_ok, market_reason = check_market_trend(index_closes)
     update_market_streak(market_ok)
 
     buy_codes = filter_buyable_codes(C, all_codes)
-    all_history = dict((code, value_by_code(market_history, code, {})) for code in all_codes)
+    all_history = dict((code, value_by_code(market_history, code, {})) for code in data_codes)
     buy_history = dict((code, value_by_code(market_history, code, {})) for code in buy_codes)
     ranked_raw, _ = build_rankings(buy_history)
     ranked, blocked_counts = filter_ranked_for_buy(ranked_raw)
     _, all_rows = build_rankings(all_history)
 
-    positions, positions_ok = safe_position_map(account_id)
-    if not positions_ok:
-        log("BLOCKED: position query failed; skip trading to avoid duplicate or blind orders")
-        mark_daily_processed(current_date)
+    active_codes = active_order_codes(account_id)
+    if active_codes is None:
+        log("BLOCKED: strategy order query failed; retry later without marking today complete")
         return
-
-    hs300_position_codes = [
-        code for code in positions.keys()
-        if any(same_code(code, hs_code) for hs_code in all_codes)
-    ]
 
     # Daily risk exit: close below MA60.
-    sell_orders_sent = 0
-    for code in hs300_position_codes:
+    risk_exit_codes = set()
+    for code in managed_codes:
         row = value_by_code(all_rows, code)
-        if not row:
-            continue
-        pos = positions.get(code, {})
-        available = sell_lot(pos.get("available", 0))
-        if available >= LOT_SIZE and row["close"] < row["ma60"]:
-            if submit_order(C, account_id, code, "SELL", available, row["close"], current_date):
-                sell_orders_sent += 1
+        if row and row["close"] < row["ma60"]:
+            risk_exit_codes.add(code)
 
-    do_rebalance = rebalance_due(current_date)
+    target_codes = pending_targets(current_date)
+    do_rebalance = bool(target_codes) or rebalance_due(current_date)
     if not do_rebalance:
+        sell_orders_sent = 0
+        for code in sorted(risk_exit_codes):
+            row = value_by_code(all_rows, code)
+            pos = positions.get(code, {})
+            available = sell_lot(pos.get("available", 0))
+            if row and available > 0 and submit_order(
+                    C, account_id, code, "SELL", available, row["close"], current_date,
+                    active_codes):
+                sell_orders_sent += 1
         days_since = trading_days_since(S.get("last_rebalance_date", ""), current_date)
-        log("daily check done: ranked_candidates={} market={} rebalance_due=False days_since_rebalance={} top={}".format(
-            len(ranked), market_reason, days_since, format_ranked(ranked, 5)))
+        log("daily check done: ranked_candidates={} market={} risk_sells={} rebalance_due=False days_since_rebalance={} top={}".format(
+            len(ranked), market_reason, sell_orders_sent, days_since, format_ranked(ranked, 5)))
         mark_daily_processed(current_date)
         return
 
-    exit_buffer = set(row["code"] for row in ranked[:EXIT_RANK])
-    target_codes = [row["code"] for row in ranked[:ENTRY_RANK]][:MAX_POSITIONS]
+    if not target_codes:
+        target_codes = select_target_codes(ranked, managed_codes)
+        begin_pending_rebalance(current_date, target_codes)
 
-    # Rebalance exits: trend failed or fell out of exit buffer.
-    for code in hs300_position_codes:
-        if code in exit_buffer:
-            continue
+    # Phase 1: fully exit every managed holding outside the capped target set.
+    sell_codes = set(code for code in managed_codes if code not in set(target_codes))
+    sell_codes.update(risk_exit_codes)
+    sell_orders_sent = 0
+    blocked_sell_codes = []
+    for code in sorted(sell_codes):
         row = value_by_code(all_rows, code)
         close = row["close"] if row else 0.0
         if close <= 0:
@@ -912,24 +1078,28 @@ def execute_strategy(C, account_id, current_date):
             close = closes[-1] if closes else 0.0
         pos = positions.get(code, {})
         available = sell_lot(pos.get("available", 0))
-        if available >= LOT_SIZE and close > 0:
-            if submit_order(C, account_id, code, "SELL", available, close, current_date):
+        if available > 0 and close > 0:
+            if submit_order(
+                    C, account_id, code, "SELL", available, close, current_date,
+                    active_codes):
                 sell_orders_sent += 1
+        else:
+            blocked_sell_codes.append(code)
+
+    if LIVE_TRADING and sell_codes:
+        log("REBALANCE SELL PHASE: sent={} waiting={} blocked={}; buys wait for refreshed positions/cash".format(
+            sell_orders_sent, len(sell_codes), ",".join(blocked_sell_codes) or "NONE"))
+        return
 
     if not target_codes:
         log("REBALANCE: no eligible candidates; blocked={} raw_top={}".format(
             format_blocked_counts(blocked_counts), format_ranked(ranked_raw, 5)))
+        clear_pending_rebalance()
         mark_rebalanced(current_date)
         mark_daily_processed(current_date)
         return
 
-    if LIVE_TRADING and sell_orders_sent > 0:
-        log("REBALANCE: {} sell orders sent; skip buys until cash/positions refresh".format(
-            sell_orders_sent))
-        mark_rebalanced(current_date)
-        mark_daily_processed(current_date)
-        return
-
+    # Phase 2 begins only after position queries confirm all required exits.
     total_asset, asset_ok = safe_account_total_asset(account_id)
     cash, cash_ok = safe_account_available_cash(account_id)
     if total_asset <= 0:
@@ -937,8 +1107,6 @@ def execute_strategy(C, account_id, current_date):
         total_asset = cash + sum(pos.get("market_value", 0.0) for pos in positions.values())
     if total_asset <= 0:
         log("BLOCKED: account asset is unavailable; skip new buys")
-        mark_rebalanced(current_date)
-        mark_daily_processed(current_date)
         return
     market_allows_buys = can_open_new_positions()
     buy_enabled = market_allows_buys and cash_ok
@@ -946,6 +1114,7 @@ def execute_strategy(C, account_id, current_date):
         reason = "market filter" if not market_allows_buys else "cash query failed"
         log("REBALANCE: sells done, new buys blocked by {}; market={}".format(
             reason, market_reason))
+        clear_pending_rebalance()
         mark_rebalanced(current_date)
         mark_daily_processed(current_date)
         return
@@ -956,6 +1125,8 @@ def execute_strategy(C, account_id, current_date):
     rank_map = dict((row["code"], idx + 1) for idx, row in enumerate(ranked))
     row_map = dict((row["code"], row) for row in ranked)
     drift_values = []
+    buy_orders_sent = 0
+    buy_orders_waiting = 0
     for code in target_codes:
         row = row_map.get(code)
         if not row:
@@ -983,17 +1154,37 @@ def execute_strategy(C, account_id, current_date):
             log("TARGET {} rank={} no buy needed; current_value={:.2f}".format(
                 code, rank_map.get(code, 0), current_value))
             continue
+        if has_active_order(account_id, code, active_codes):
+            buy_orders_waiting += 1
+            log("TARGET {} rank={} waiting for active buy order".format(
+                code, rank_map.get(code, 0)))
+            continue
+        remark = make_remark(current_date, code, "BUY", 0)
+        if attempt_recorded(current_date, remark):
+            if current_shares <= 0:
+                buy_orders_waiting += 1
+                log("TARGET {} rank={} waiting for submitted buy to appear in positions".format(
+                    code, rank_map.get(code, 0)))
+            continue
         buy_value = min(delta_value, available_cash)
         volume = buy_lot(buy_value / close)
         if volume < LOT_SIZE:
             log("TARGET {} rank={} insufficient cash; cash_left={:.2f}".format(
                 code, rank_map.get(code, 0), available_cash))
             continue
-        if submit_order(C, account_id, code, "BUY", volume, close, current_date):
+        if submit_order(
+                C, account_id, code, "BUY", volume, close, current_date, active_codes):
+            buy_orders_sent += 1
             available_cash -= volume * close * (1.0 + BUY_PRICE_BUFFER)
         log("TARGET {} rank={} momentum60={:.2%}".format(
             code, rank_map.get(code, 0), row["momentum"]))
 
+    if LIVE_TRADING and (buy_orders_sent > 0 or buy_orders_waiting > 0):
+        log("REBALANCE BUY PHASE: sent={} waiting={}; completion awaits order/position refresh".format(
+            buy_orders_sent, buy_orders_waiting))
+        return
+
+    clear_pending_rebalance()
     mark_rebalanced(current_date)
     mark_daily_processed(current_date)
 
@@ -1001,6 +1192,9 @@ def execute_strategy(C, account_id, current_date):
 # ========================= QMT ENTRY POINTS =========================
 
 def init(C):
+    global S
+    if QMT_BACKTEST_MODE:
+        S = new_state()
     account_id = current_account_id()
     configure_state_file(account_id)
     load_state()
@@ -1018,30 +1212,33 @@ def init(C):
     except Exception as exc:
         log("WARNING: set_universe failed: {}".format(exc))
 
-    log("initialized: live={} account={} sector={} window={}-{} state={}".format(
-        LIVE_TRADING, account_id or "NOT_SET", SECTOR_NAME,
+    log("initialized: live={} qmt_backtest={} account={} sector={} window={}-{} state={}".format(
+        LIVE_TRADING, QMT_BACKTEST_MODE, account_id or "NOT_SET", SECTOR_NAME,
         EXECUTE_AFTER, EXECUTE_BEFORE, STATE_FILE))
     if not LIVE_TRADING:
         log("SAFE MODE: LIVE_TRADING=False; no real order will be sent")
 
 
 def handlebar(C):
-    try:
-        if not C.is_last_bar():
-            return
-    except Exception:
-        pass
+    if not QMT_BACKTEST_MODE:
+        try:
+            if not C.is_last_bar():
+                return
+        except Exception:
+            pass
 
-    current_date = today_text()
+    runtime = context_datetime(C)
+    current_date = runtime.strftime("%Y%m%d")
     if current_date < TRADE_START:
         return
-    if datetime.now().weekday() > 4:
+    if runtime.weekday() > 4:
         return
-    hhmmss = now_hhmmss()
-    if hhmmss >= CLOSING_AUCTION_START:
-        return
-    if hhmmss < EXECUTE_AFTER or hhmmss > EXECUTE_BEFORE:
-        return
+    if not QMT_BACKTEST_MODE:
+        hhmmss = runtime.strftime("%H%M%S")
+        if hhmmss >= CLOSING_AUCTION_START:
+            return
+        if hhmmss < EXECUTE_AFTER or hhmmss > EXECUTE_BEFORE:
+            return
     if daily_already_processed(current_date):
         return
 
@@ -1058,9 +1255,15 @@ def handlebar(C):
 
 def order_callback(C, order_info):
     try:
+        status = int(attr_number(order_info, ["m_nOrderStatus"], 0))
+        remark = attr_text(order_info, ["m_strRemark", "m_strUserOrderId"], "")
+        raw_order_date = attr_text(order_info, ["m_strInsertDate", "m_strOrderDate"], "")
+        order_date = "".join(ch for ch in raw_order_date if ch.isdigit())[:8]
+        if status in RETRYABLE_TERMINAL_STATUSES and remark:
+            forget_attempt(order_date or datetime.now().strftime("%Y%m%d"), remark)
         log("order callback: code={} status={} traded={} price={}".format(
             full_code_from_record(order_info),
-            int(attr_number(order_info, ["m_nOrderStatus"], 0)),
+            status,
             int(attr_number(order_info, ["m_nVolumeTraded", "m_nTradedVolume"], 0)),
             attr_number(order_info, ["m_dPrice", "m_dTradedPrice"], 0.0)))
     except Exception as exc:

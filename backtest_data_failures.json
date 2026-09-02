@@ -1,10 +1,6 @@
 [
   [
-    "sh600930",
-    "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
-  ],
-  [
     "sz001280",
-    "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
+    "insufficient history: 183 < 270"
   ]
 ]
