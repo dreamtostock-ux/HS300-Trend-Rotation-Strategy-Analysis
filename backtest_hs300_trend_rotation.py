@@ -46,6 +46,13 @@ MA_LONG = 250
 LONG_SLOPE_LOOKBACK = 20
 MOMENTUM_PERIOD = 60
 CASH_BUFFER = 0.01
+MARKET_FILTER_ENABLED = True
+MARKET_OK_STREAK_REQUIRED = 2
+MARKET_MA_PERIOD = 20
+MARKET_DAILY_DROP_BLOCK = 0.03
+FILTER_STAR_MARKET = True
+FILTER_LIMIT_UP_BUYS = True
+LIMIT_UP_THRESHOLD = 0.09
 
 COMMISSION = 0.0003
 MIN_COMMISSION = 5.0
@@ -178,14 +185,57 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     return out.set_index("date")
 
 
+def enrich_benchmark(df: pd.DataFrame) -> pd.DataFrame:
+    out = clean_columns(df)
+    out["ma_market"] = sma(out["close"], MARKET_MA_PERIOD)
+    fast = out["close"].ewm(span=12, adjust=False).mean()
+    slow = out["close"].ewm(span=26, adjust=False).mean()
+    dif = fast - slow
+    dea = dif.ewm(span=9, adjust=False).mean()
+    out["macd_hist"] = dif - dea
+    out["pct_change"] = out["close"].pct_change()
+    return out.set_index("date")
+
+
+def is_star_market(code: str) -> bool:
+    return str(code).lower().startswith("sh688")
+
+
+def is_limit_up_candidate(record: dict) -> bool:
+    if not FILTER_LIMIT_UP_BUYS:
+        return False
+    prev_close = record.get("prev_close")
+    close = record.get("close")
+    if prev_close is None or close is None or prev_close <= 0:
+        return False
+    return close >= prev_close * (1.0 + LIMIT_UP_THRESHOLD)
+
+
+def check_market_trend(benchmark: pd.DataFrame, date: pd.Timestamp) -> tuple[bool, str]:
+    if not MARKET_FILTER_ENABLED:
+        return True, "disabled"
+    if date not in benchmark.index:
+        return False, "index_missing"
+    row = benchmark.loc[date]
+    values = [row.get("close"), row.get("ma_market"), row.get("macd_hist")]
+    if any(pd.isna(value) for value in values):
+        return False, "index_indicator_unavailable"
+    if float(row.get("pct_change", 0.0)) <= -MARKET_DAILY_DROP_BLOCK:
+        return False, "index_daily_drop"
+    if float(row["close"]) > float(row["ma_market"]) and float(row["macd_hist"]) > 0:
+        return True, "ok"
+    return False, "index_trend_weak"
+
+
 def floor_lot(value: float) -> int:
     if not np.isfinite(value) or value <= 0:
         return 0
     return int(math.floor(value / LOT_SIZE) * LOT_SIZE)
 
 
-def backtest(data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def backtest(data: dict[str, pd.DataFrame], benchmark: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     enriched = {code: enrich(df) for code, df in data.items()}
+    benchmark_enriched = enrich_benchmark(benchmark)
     calendars = sorted(set().union(*(set(df.index) for df in enriched.values())))
     calendars = [d for d in calendars if d >= pd.Timestamp(TRADE_START)]
 
@@ -195,6 +245,7 @@ def backtest(data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]
     trades: list[dict] = []
     equity_rows: list[dict] = []
     rebalance_count = 0
+    market_ok_streak = 0
 
     prev_date = None
     for date in calendars:
@@ -260,14 +311,26 @@ def backtest(data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]
             record = {
                 "code": code,
                 "close": float(row["close"]),
+                "prev_close": float(df.at[prev_date, "close"]) if prev_date in df.index else None,
                 "ma60": float(row["ma60"]),
                 "eligible": bool(row["eligible"]),
                 "momentum60": float(row["momentum60"]),
             }
             all_rows[code] = record
-            if record["eligible"]:
+            buyable = not (FILTER_STAR_MARKET and is_star_market(code))
+            if record["eligible"] and buyable and not is_limit_up_candidate(record):
                 rows.append(record)
         rows.sort(key=lambda x: x["momentum60"], reverse=True)
+
+        market_ok, market_reason = check_market_trend(benchmark_enriched, date)
+        if market_ok:
+            market_ok_streak += 1
+        else:
+            market_ok_streak = 0
+        market_allows_buys = (
+            (not MARKET_FILTER_ENABLED) or
+            market_ok_streak >= MARKET_OK_STREAK_REQUIRED
+        )
 
         order_codes = set()
         for code, shares in list(positions.items()):
@@ -286,19 +349,20 @@ def backtest(data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]
                     pending.append(Order(code, -shares))
                     order_codes.add(code)
 
-            target_value = close_value / MAX_POSITIONS
-            for code in targets:
-                if code in order_codes:
-                    continue
-                row = all_rows.get(code)
-                if not row:
-                    continue
-                current = positions.get(code, 0)
-                target_shares = floor_lot(target_value * (1.0 - CASH_BUFFER) / row["close"])
-                delta = target_shares - current
-                if abs(delta) >= LOT_SIZE:
-                    pending.append(Order(code, delta))
-                    order_codes.add(code)
+            if market_allows_buys:
+                target_value = close_value / MAX_POSITIONS
+                for code in targets:
+                    if code in order_codes:
+                        continue
+                    row = all_rows.get(code)
+                    if not row:
+                        continue
+                    current = positions.get(code, 0)
+                    target_shares = floor_lot(target_value * (1.0 - CASH_BUFFER) / row["close"])
+                    delta = target_shares - current
+                    if abs(delta) >= LOT_SIZE:
+                        pending.append(Order(code, delta))
+                        order_codes.add(code)
 
         equity_rows.append({
             "date": date,
@@ -307,6 +371,9 @@ def backtest(data: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]
             "positions": len([s for s in positions.values() if s > 0]),
             "eligible": len(rows),
             "rebalanced": rebalanced,
+            "market_ok": market_ok,
+            "market_reason": market_reason,
+            "market_ok_streak": market_ok_streak,
         })
         prev_date = date
 
@@ -355,8 +422,8 @@ def main():
     print(f"constituents={len(codes)}")
     data = load_price_data(codes)
     print(f"usable_symbols={len(data)}")
-    equity, trades = backtest(data)
     benchmark = clean_columns(ak.stock_zh_index_daily_tx(symbol="sh000300"))
+    equity, trades = backtest(data, benchmark)
     stats = calc_stats(equity, benchmark)
     stats["trade_count"] = int(len(trades))
     stats["constituents"] = len(codes)

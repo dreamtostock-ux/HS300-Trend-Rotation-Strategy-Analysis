@@ -68,6 +68,16 @@ CASH_BUFFER = 0.01
 # Optional hard guard. 0 means no cap other than account cash.
 MAX_BUY_VALUE_PER_STOCK = 0.0
 
+# Execution safety filters borrowed from the reviewed quant-trade project.
+MARKET_FILTER_ENABLED = True
+MARKET_OK_STREAK_REQUIRED = 2
+MARKET_MA_PERIOD = 20
+MARKET_DAILY_DROP_BLOCK = 0.03
+FILTER_STAR_MARKET = True
+FILTER_ST_STOCKS = True
+FILTER_LIMIT_UP_BUYS = True
+LIMIT_UP_THRESHOLD = 0.09
+
 STATE_DIR_NAME = "QMTStrategyState"
 STATE_FILE = ""
 
@@ -81,6 +91,8 @@ S = {
     "rebalance_counter": 0,
     "last_processed_date": "",
     "last_rebalance_date": "",
+    "market_ok_streak": 0,
+    "market_weak_streak": 0,
     "attempts": {},        # {yyyymmdd: [remark, ...]}
 }
 
@@ -341,6 +353,25 @@ def latest_close_map(C, codes):
     return result
 
 
+def latest_ohlc_map(C, codes):
+    data = get_market_data(C, ["open", "high", "low", "close"], codes, DAILY_BAR_COUNT)
+    result = {}
+    for code in codes:
+        frame = stock_frame(data, code)
+        closes = frame_values(frame, "close")
+        highs = frame_values(frame, "high")
+        lows = frame_values(frame, "low")
+        opens = frame_values(frame, "open")
+        if closes:
+            result[code] = {
+                "open": opens,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+            }
+    return result
+
+
 # ========================= ACCOUNT AND ORDER QUERIES =========================
 
 def qmt_detail(account_id, detail_type, strategy_name=None):
@@ -386,6 +417,30 @@ def position_map(account_id):
     return result
 
 
+def safe_account_total_asset(account_id):
+    try:
+        return account_total_asset(account_id), True
+    except Exception as exc:
+        log("account asset query failed: {}".format(exc))
+        return 0.0, False
+
+
+def safe_account_available_cash(account_id):
+    try:
+        return account_available_cash(account_id), True
+    except Exception as exc:
+        log("account cash query failed: {}".format(exc))
+        return 0.0, False
+
+
+def safe_position_map(account_id):
+    try:
+        return position_map(account_id), True
+    except Exception as exc:
+        log("position query failed: {}".format(exc))
+        return {}, False
+
+
 def has_active_order(account_id, stock_code):
     try:
         orders = qmt_detail(account_id, "order") or []
@@ -412,6 +467,114 @@ def has_active_order(account_id, stock_code):
 
 # ========================= SIGNAL LOGIC =========================
 
+def ema(values, period):
+    if not values:
+        return []
+    alpha = 2.0 / float(period + 1)
+    result = [float(values[0])]
+    for value in values[1:]:
+        result.append(alpha * float(value) + (1.0 - alpha) * result[-1])
+    return result
+
+
+def macd_hist(values, fast=12, slow=26, signal=9):
+    if len(values) < slow + signal:
+        return []
+    fast_ema = ema(values, fast)
+    slow_ema = ema(values, slow)
+    dif = [f - s for f, s in zip(fast_ema, slow_ema)]
+    dea = ema(dif, signal)
+    return [d - e for d, e in zip(dif, dea)]
+
+
+def check_market_trend(index_closes):
+    if not MARKET_FILTER_ENABLED:
+        return True, "disabled"
+    if len(index_closes) < max(MARKET_MA_PERIOD, 35):
+        return False, "index_history_insufficient"
+    last = float(index_closes[-1])
+    prev = float(index_closes[-2])
+    if prev > 0 and (last - prev) / prev <= -MARKET_DAILY_DROP_BLOCK:
+        return False, "index_daily_drop"
+    ma = moving_average(index_closes, MARKET_MA_PERIOD)
+    hist = macd_hist(index_closes)
+    if ma is None or not hist:
+        return False, "index_indicator_unavailable"
+    if last > ma and hist[-1] > 0:
+        return True, "ok"
+    return False, "index_trend_weak"
+
+
+def update_market_streak(market_ok):
+    if market_ok:
+        S["market_ok_streak"] = int(S.get("market_ok_streak", 0) or 0) + 1
+        S["market_weak_streak"] = 0
+    else:
+        S["market_ok_streak"] = 0
+        S["market_weak_streak"] = int(S.get("market_weak_streak", 0) or 0) + 1
+
+
+def can_open_new_positions():
+    if not MARKET_FILTER_ENABLED:
+        return True
+    return int(S.get("market_ok_streak", 0) or 0) >= MARKET_OK_STREAK_REQUIRED
+
+
+def is_star_market(code):
+    value = normalize_stock_code(code)
+    return value.startswith("688")
+
+
+def instrument_name(C, code):
+    methods = [getattr(C, "get_instrumentdetail", None), globals().get("get_instrumentdetail")]
+    for method in methods:
+        if not callable(method):
+            continue
+        try:
+            detail = method(code)
+            if isinstance(detail, dict):
+                return str(
+                    detail.get("m_strInstrumentName")
+                    or detail.get("InstrumentName")
+                    or detail.get("name")
+                    or ""
+                )
+        except Exception:
+            continue
+    return ""
+
+
+def filter_buyable_codes(C, codes):
+    result = []
+    st_failures = 0
+    for code in codes:
+        norm = normalize_stock_code(code)
+        if FILTER_STAR_MARKET and is_star_market(norm):
+            continue
+        if FILTER_ST_STOCKS:
+            name = instrument_name(C, norm)
+            if "ST" in name.upper():
+                continue
+            if not name:
+                st_failures += 1
+        result.append(norm)
+    if st_failures > 0:
+        log("instrument detail unavailable for {} symbols; kept them".format(st_failures))
+    return result
+
+
+def is_limit_up_candidate(row):
+    if not FILTER_LIMIT_UP_BUYS:
+        return False
+    closes = row.get("closes") or []
+    if len(closes) < 2:
+        return False
+    prev = float(closes[-2])
+    last = float(closes[-1])
+    if prev <= 0:
+        return False
+    return last >= prev * (1.0 + LIMIT_UP_THRESHOLD)
+
 def moving_average(values, period):
     if len(values) < period:
         return None
@@ -436,6 +599,7 @@ def candidate_snapshot(code, closes):
     return {
         "code": code,
         "close": close,
+        "closes": closes,
         "ma60": ma60,
         "eligible": bool(eligible),
         "momentum": momentum,
@@ -454,6 +618,15 @@ def build_rankings(close_history):
             rows.append(row)
     rows.sort(key=lambda row: row["momentum"], reverse=True)
     return rows, all_rows
+
+
+def value_by_code(mapping, code, default=None):
+    if code in mapping:
+        return mapping.get(code)
+    for key, value in mapping.items():
+        if same_code(key, code):
+            return value
+    return default
 
 
 def rebalance_due(current_date):
@@ -543,27 +716,42 @@ def submit_order(C, account_id, code, side, volume, reference_price, current_dat
 
 
 def execute_strategy(C, account_id, current_date):
-    codes = get_hs300_codes(C)
-    if not codes:
+    all_codes = get_hs300_codes(C)
+    if not all_codes:
         log("BLOCKED: no HS300 constituents returned by QMT sector query")
         return
 
     try:
-        C.set_universe([BENCHMARK_CODE] + codes)
+        C.set_universe([BENCHMARK_CODE] + all_codes)
     except Exception:
         pass
 
-    close_history = latest_close_map(C, codes)
-    ranked, all_rows = build_rankings(close_history)
-    positions = position_map(account_id)
+    close_history = latest_close_map(C, [BENCHMARK_CODE] + all_codes)
+    index_closes = close_history.get(BENCHMARK_CODE, [])
+    market_ok, market_reason = check_market_trend(index_closes)
+    update_market_streak(market_ok)
+
+    buy_codes = filter_buyable_codes(C, all_codes)
+    all_history = dict((code, close_history.get(code, [])) for code in all_codes)
+    buy_history = dict((code, close_history.get(code, [])) for code in buy_codes)
+    ranked, _ = build_rankings(buy_history)
+    ranked = [row for row in ranked if not is_limit_up_candidate(row)]
+    _, all_rows = build_rankings(all_history)
+
+    positions, positions_ok = safe_position_map(account_id)
+    if not positions_ok:
+        log("BLOCKED: position query failed; skip trading to avoid duplicate or blind orders")
+        mark_daily_processed(current_date)
+        return
+
     hs300_position_codes = [
         code for code in positions.keys()
-        if any(same_code(code, hs_code) for hs_code in codes)
+        if any(same_code(code, hs_code) for hs_code in all_codes)
     ]
 
     # Daily risk exit: close below MA60.
     for code in hs300_position_codes:
-        row = all_rows.get(code)
+        row = value_by_code(all_rows, code)
         if not row:
             continue
         pos = positions.get(code, {})
@@ -573,7 +761,8 @@ def execute_strategy(C, account_id, current_date):
 
     do_rebalance = rebalance_due(current_date)
     if not do_rebalance:
-        log("daily check done: ranked_candidates={} rebalance_due=False".format(len(ranked)))
+        log("daily check done: ranked_candidates={} market={} rebalance_due=False".format(
+            len(ranked), market_reason))
         mark_daily_processed(current_date)
         return
 
@@ -584,10 +773,10 @@ def execute_strategy(C, account_id, current_date):
     for code in hs300_position_codes:
         if code in exit_buffer:
             continue
-        row = all_rows.get(code)
+        row = value_by_code(all_rows, code)
         close = row["close"] if row else 0.0
         if close <= 0:
-            closes = close_history.get(code, [])
+            closes = value_by_code(close_history, code, [])
             close = closes[-1] if closes else 0.0
         pos = positions.get(code, {})
         available = sell_lot(pos.get("available", 0))
@@ -600,18 +789,33 @@ def execute_strategy(C, account_id, current_date):
         mark_daily_processed(current_date)
         return
 
-    total_asset = account_total_asset(account_id)
-    cash = account_available_cash(account_id)
+    total_asset, asset_ok = safe_account_total_asset(account_id)
+    cash, cash_ok = safe_account_available_cash(account_id)
     if total_asset <= 0:
         # Fallback when QMT account detail does not expose total assets.
         total_asset = cash + sum(pos.get("market_value", 0.0) for pos in positions.values())
+    if total_asset <= 0:
+        log("BLOCKED: account asset is unavailable; skip new buys")
+        mark_rebalanced(current_date)
+        mark_daily_processed(current_date)
+        return
+    market_allows_buys = can_open_new_positions()
+    buy_enabled = market_allows_buys and cash_ok
+    if not buy_enabled:
+        reason = "market filter" if not market_allows_buys else "cash query failed"
+        log("REBALANCE: sells done, new buys blocked by {}; market={}".format(
+            reason, market_reason))
+        mark_rebalanced(current_date)
+        mark_daily_processed(current_date)
+        return
+
     target_value = total_asset / float(MAX_POSITIONS)
     available_cash = max(0.0, cash * (1.0 - CASH_BUFFER))
 
     rank_map = dict((row["code"], idx + 1) for idx, row in enumerate(ranked))
     row_map = dict((row["code"], row) for row in ranked)
-    log("REBALANCE: candidates={} targets={} total_asset={:.2f} cash={:.2f}".format(
-        len(ranked), ",".join(target_codes), total_asset, cash))
+    log("REBALANCE: candidates={} targets={} total_asset={:.2f} cash={:.2f} market={} asset_ok={}".format(
+        len(ranked), ",".join(target_codes), total_asset, cash, market_reason, asset_ok))
 
     for code in target_codes:
         row = row_map.get(code)

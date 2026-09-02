@@ -17,6 +17,7 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 - Ranking: 60-day return among eligible stocks.
 - Rebalance: every 5 trading days, up to 5 positions.
 - Exit: daily close below MA60, or exit buffer failure on rebalance day.
+- Borrowed safety components: HS300 index market filter, ST/STAR-board buy filter, limit-up buy avoidance, state persistence, active-order checks, and account/position query failure protection.
 
 ## Safety
 
@@ -29,6 +30,15 @@ Before enabling live trading:
 3. Change `LIVE_TRADING = True` only after validation.
 
 This project is for strategy research and execution testing only. It is not investment advice or a promise of returns.
+
+## Latest Backtest
+
+Public-data backtest window: 2021-09-02 to 2026-09-01, initial capital 1,000,000 CNY.
+
+- Strategy total return: 60.79%; annual return: 9.97%.
+- Max drawdown: -45.31%; Sharpe: 0.46.
+- Trade count: 499.
+- HS300 benchmark total return: -5.30%; annual return: -1.08%; max drawdown: -37.86%.
 
 ## Backtest Limitation
 
