@@ -9,6 +9,7 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 - `backtest_summary.json`: latest backtest summary.
 - `backtest_equity_curve.csv`: latest backtest equity curve.
 - `backtest_trades.csv`: latest backtest trade log.
+- `parameter_scan_hs300.py`: small parameter sensitivity scan for rebalance/rank/MA settings.
 
 ## Strategy Summary
 
@@ -17,7 +18,9 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 - Ranking: 60-day return among eligible stocks.
 - Rebalance: every 5 trading days, up to 5 positions.
 - Exit: daily close below MA60, or exit buffer failure on rebalance day.
-- Borrowed safety components: HS300 index market filter, ST/STAR-board buy filter, limit-up buy avoidance, state persistence, active-order checks, and account/position query failure protection.
+- Borrowed safety components: HS300 index market filter, ST/STAR-board buy filter, suspended/limit-up/limit-down buy avoidance, liquidity filter, state persistence, active-order checks, and account/position query failure protection.
+- Rebalance timing: based on recorded trading dates instead of a simple counter.
+- Logging: prints candidate counts, blocked-buy reasons, top rankings, targets, and position drift.
 
 ## Safety
 
@@ -33,13 +36,13 @@ This project is for strategy research and execution testing only. It is not inve
 
 ## Latest Backtest
 
-Public-data backtest window: 2021-09-02 to 2026-09-01, initial capital 1,000,000 CNY.
+Public-data backtest window: 2021-09-02 to 2026-09-02, initial capital 1,000,000 CNY.
 
-- Strategy total return: 60.79%; annual return: 9.97%.
-- Max drawdown: -45.31%; Sharpe: 0.46.
-- Trade count: 499.
+- Strategy total return: 93.27%; annual return: 14.09%.
+- Max drawdown: -41.04%; Sharpe: 0.58.
+- Trade count: 512.
 - HS300 benchmark total return: -5.30%; annual return: -1.08%; max drawdown: -37.86%.
 
 ## Backtest Limitation
 
-The included backtest uses current HS300 constituents across the full historical window, so it has survivorship bias. Treat it as an approximate strategy sanity check rather than a fully point-in-time index constituent backtest.
+The included backtest uses current HS300 constituents across the full historical window, so it has survivorship bias. The latest run used 286 usable symbols out of 288 current constituents because several public-data requests failed or had insufficient history. Treat it as an approximate strategy sanity check rather than a fully point-in-time index constituent backtest.

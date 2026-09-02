@@ -34,6 +34,7 @@ ACCOUNT_ID = ""
 LIVE_TRADING = False
 
 SECTOR_NAME = "沪深300"
+SECTOR_ALIASES = ["沪深300", "沪深300成份股", "沪深300成分股"]
 BENCHMARK_CODE = "000300.SH"
 
 MAX_POSITIONS = 5
@@ -75,8 +76,13 @@ MARKET_MA_PERIOD = 20
 MARKET_DAILY_DROP_BLOCK = 0.03
 FILTER_STAR_MARKET = True
 FILTER_ST_STOCKS = True
+FILTER_SUSPENDED_BUYS = True
 FILTER_LIMIT_UP_BUYS = True
+FILTER_LIMIT_DOWN_BUYS = True
 LIMIT_UP_THRESHOLD = 0.09
+LIMIT_DOWN_THRESHOLD = 0.09
+AMOUNT_LOOKBACK = 20
+MIN_AVG_AMOUNT = 20000000.0
 
 STATE_DIR_NAME = "QMTStrategyState"
 STATE_FILE = ""
@@ -88,9 +94,9 @@ S = {
     "schema_version": 1,
     "account": "",
     "live": None,
-    "rebalance_counter": 0,
     "last_processed_date": "",
     "last_rebalance_date": "",
+    "trade_dates": [],
     "market_ok_streak": 0,
     "market_weak_streak": 0,
     "attempts": {},        # {yyyymmdd: [remark, ...]}
@@ -256,11 +262,11 @@ def get_hs300_codes(C):
         getattr(C, "get_sector", None),
         globals().get("get_sector"),
     ]
-    codes = call_first(methods, (SECTOR_NAME,))
-    if not codes:
-        codes = call_first(methods, ("沪深300成份股",))
-    if not codes:
-        codes = call_first(methods, ("沪深300成分股",))
+    codes = None
+    for sector_name in SECTOR_ALIASES:
+        codes = call_first(methods, (sector_name,))
+        if codes:
+            break
     result = []
     for code in codes or []:
         value = normalize_stock_code(str(code))
@@ -353,21 +359,21 @@ def latest_close_map(C, codes):
     return result
 
 
-def latest_ohlc_map(C, codes):
-    data = get_market_data(C, ["open", "high", "low", "close"], codes, DAILY_BAR_COUNT)
+def latest_market_map(C, codes):
+    data = get_market_data(
+        C, ["open", "high", "low", "close", "volume", "amount"], codes, DAILY_BAR_COUNT)
     result = {}
     for code in codes:
         frame = stock_frame(data, code)
         closes = frame_values(frame, "close")
-        highs = frame_values(frame, "high")
-        lows = frame_values(frame, "low")
-        opens = frame_values(frame, "open")
         if closes:
             result[code] = {
-                "open": opens,
-                "high": highs,
-                "low": lows,
+                "open": frame_values(frame, "open"),
+                "high": frame_values(frame, "high"),
+                "low": frame_values(frame, "low"),
                 "close": closes,
+                "volume": frame_values(frame, "volume"),
+                "amount": frame_values(frame, "amount"),
             }
     return result
 
@@ -563,29 +569,41 @@ def filter_buyable_codes(C, codes):
     return result
 
 
-def is_limit_up_candidate(row):
-    if not FILTER_LIMIT_UP_BUYS:
-        return False
-    closes = row.get("closes") or []
-    if len(closes) < 2:
-        return False
-    prev = float(closes[-2])
-    last = float(closes[-1])
-    if prev <= 0:
-        return False
-    return last >= prev * (1.0 + LIMIT_UP_THRESHOLD)
-
 def moving_average(values, period):
     if len(values) < period:
         return None
     return sum(values[-period:]) / float(period)
 
 
-def candidate_snapshot(code, closes):
+def tail_value(values, default=0.0):
+    if values:
+        return float(values[-1])
+    return default
+
+
+def average_tail(values, period):
+    tail = [float(value) for value in values[-period:] if is_valid_number(value)]
+    if not tail:
+        return None
+    return sum(tail) / float(len(tail))
+
+
+def candidate_snapshot(code, history):
+    if isinstance(history, dict):
+        closes = history.get("close") or []
+        opens = history.get("open") or []
+        highs = history.get("high") or []
+        lows = history.get("low") or []
+        volumes = history.get("volume") or []
+        amounts = history.get("amount") or []
+    else:
+        closes = history or []
+        opens, highs, lows, volumes, amounts = [], [], [], [], []
     required = max(MA_LONG + LONG_SLOPE_LOOKBACK, MOMENTUM_PERIOD + 1)
     if len(closes) < required:
         return None
     close = float(closes[-1])
+    prev_close = float(closes[-2]) if len(closes) >= 2 else 0.0
     ma20 = moving_average(closes, MA_FAST)
     ma60 = moving_average(closes, MA_MID)
     ma250 = moving_average(closes, MA_LONG)
@@ -600,6 +618,13 @@ def candidate_snapshot(code, closes):
         "code": code,
         "close": close,
         "closes": closes,
+        "prev_close": prev_close,
+        "open": tail_value(opens),
+        "high": tail_value(highs),
+        "low": tail_value(lows),
+        "volume": tail_value(volumes),
+        "amount": tail_value(amounts),
+        "avg_amount": average_tail(amounts, AMOUNT_LOOKBACK),
         "ma60": ma60,
         "eligible": bool(eligible),
         "momentum": momentum,
@@ -620,6 +645,62 @@ def build_rankings(close_history):
     return rows, all_rows
 
 
+def buy_block_reason(row):
+    if FILTER_SUSPENDED_BUYS and row.get("volume", 0.0) <= 0:
+        return "suspended_or_zero_volume"
+    prev = float(row.get("prev_close", 0.0) or 0.0)
+    close = float(row.get("close", 0.0) or 0.0)
+    if prev > 0 and FILTER_LIMIT_UP_BUYS and close >= prev * (1.0 + LIMIT_UP_THRESHOLD):
+        return "limit_up"
+    if prev > 0 and FILTER_LIMIT_DOWN_BUYS and close <= prev * (1.0 - LIMIT_DOWN_THRESHOLD):
+        return "limit_down"
+    avg_amount = row.get("avg_amount")
+    if MIN_AVG_AMOUNT > 0 and avg_amount is not None and avg_amount < MIN_AVG_AMOUNT:
+        return "low_liquidity"
+    return ""
+
+
+def filter_ranked_for_buy(rows):
+    result = []
+    blocked = {}
+    for row in rows:
+        reason = buy_block_reason(row)
+        if reason:
+            blocked[reason] = blocked.get(reason, 0) + 1
+            continue
+        result.append(row)
+    return result, blocked
+
+
+def format_ranked(rows, limit=10):
+    values = []
+    for idx, row in enumerate(rows[:limit], 1):
+        values.append("{}:{}:{:.2%}".format(idx, row["code"], row["momentum"]))
+    return ",".join(values) if values else "NONE"
+
+
+def format_blocked_counts(blocked):
+    if not blocked:
+        return "NONE"
+    return ",".join("{}={}".format(key, blocked[key]) for key in sorted(blocked.keys()))
+
+
+def remember_trade_date(current_date):
+    dates = S.setdefault("trade_dates", [])
+    if current_date not in dates:
+        dates.append(current_date)
+        dates.sort()
+    if len(dates) > 250:
+        del dates[:-250]
+
+
+def trading_days_since(last_date, current_date):
+    dates = S.get("trade_dates", [])
+    if last_date not in dates or current_date not in dates:
+        return REBALANCE_DAYS
+    return dates.index(current_date) - dates.index(last_date)
+
+
 def value_by_code(mapping, code, default=None):
     if code in mapping:
         return mapping.get(code)
@@ -632,9 +713,10 @@ def value_by_code(mapping, code, default=None):
 def rebalance_due(current_date):
     if S.get("last_rebalance_date") == current_date:
         return False
-    count = int(S.get("rebalance_counter", 0) or 0) + 1
-    S["rebalance_counter"] = count
-    return (count - 1) % REBALANCE_DAYS == 0
+    last_date = S.get("last_rebalance_date", "")
+    if not last_date:
+        return True
+    return trading_days_since(last_date, current_date) >= REBALANCE_DAYS
 
 
 def daily_already_processed(current_date):
@@ -716,6 +798,7 @@ def submit_order(C, account_id, code, side, volume, reference_price, current_dat
 
 
 def execute_strategy(C, account_id, current_date):
+    remember_trade_date(current_date)
     all_codes = get_hs300_codes(C)
     if not all_codes:
         log("BLOCKED: no HS300 constituents returned by QMT sector query")
@@ -726,16 +809,17 @@ def execute_strategy(C, account_id, current_date):
     except Exception:
         pass
 
-    close_history = latest_close_map(C, [BENCHMARK_CODE] + all_codes)
-    index_closes = close_history.get(BENCHMARK_CODE, [])
+    market_history = latest_market_map(C, [BENCHMARK_CODE] + all_codes)
+    index_history = value_by_code(market_history, BENCHMARK_CODE, {})
+    index_closes = index_history.get("close", [])
     market_ok, market_reason = check_market_trend(index_closes)
     update_market_streak(market_ok)
 
     buy_codes = filter_buyable_codes(C, all_codes)
-    all_history = dict((code, close_history.get(code, [])) for code in all_codes)
-    buy_history = dict((code, close_history.get(code, [])) for code in buy_codes)
-    ranked, _ = build_rankings(buy_history)
-    ranked = [row for row in ranked if not is_limit_up_candidate(row)]
+    all_history = dict((code, value_by_code(market_history, code, {})) for code in all_codes)
+    buy_history = dict((code, value_by_code(market_history, code, {})) for code in buy_codes)
+    ranked_raw, _ = build_rankings(buy_history)
+    ranked, blocked_counts = filter_ranked_for_buy(ranked_raw)
     _, all_rows = build_rankings(all_history)
 
     positions, positions_ok = safe_position_map(account_id)
@@ -750,6 +834,7 @@ def execute_strategy(C, account_id, current_date):
     ]
 
     # Daily risk exit: close below MA60.
+    sell_orders_sent = 0
     for code in hs300_position_codes:
         row = value_by_code(all_rows, code)
         if not row:
@@ -757,12 +842,14 @@ def execute_strategy(C, account_id, current_date):
         pos = positions.get(code, {})
         available = sell_lot(pos.get("available", 0))
         if available >= LOT_SIZE and row["close"] < row["ma60"]:
-            submit_order(C, account_id, code, "SELL", available, row["close"], current_date)
+            if submit_order(C, account_id, code, "SELL", available, row["close"], current_date):
+                sell_orders_sent += 1
 
     do_rebalance = rebalance_due(current_date)
     if not do_rebalance:
-        log("daily check done: ranked_candidates={} market={} rebalance_due=False".format(
-            len(ranked), market_reason))
+        days_since = trading_days_since(S.get("last_rebalance_date", ""), current_date)
+        log("daily check done: ranked_candidates={} market={} rebalance_due=False days_since_rebalance={} top={}".format(
+            len(ranked), market_reason, days_since, format_ranked(ranked, 5)))
         mark_daily_processed(current_date)
         return
 
@@ -776,15 +863,25 @@ def execute_strategy(C, account_id, current_date):
         row = value_by_code(all_rows, code)
         close = row["close"] if row else 0.0
         if close <= 0:
-            closes = value_by_code(close_history, code, [])
+            history = value_by_code(market_history, code, {})
+            closes = history.get("close", []) if isinstance(history, dict) else []
             close = closes[-1] if closes else 0.0
         pos = positions.get(code, {})
         available = sell_lot(pos.get("available", 0))
         if available >= LOT_SIZE and close > 0:
-            submit_order(C, account_id, code, "SELL", available, close, current_date)
+            if submit_order(C, account_id, code, "SELL", available, close, current_date):
+                sell_orders_sent += 1
 
     if not target_codes:
-        log("REBALANCE: no eligible candidates")
+        log("REBALANCE: no eligible candidates; blocked={} raw_top={}".format(
+            format_blocked_counts(blocked_counts), format_ranked(ranked_raw, 5)))
+        mark_rebalanced(current_date)
+        mark_daily_processed(current_date)
+        return
+
+    if LIVE_TRADING and sell_orders_sent > 0:
+        log("REBALANCE: {} sell orders sent; skip buys until cash/positions refresh".format(
+            sell_orders_sent))
         mark_rebalanced(current_date)
         mark_daily_processed(current_date)
         return
@@ -814,8 +911,18 @@ def execute_strategy(C, account_id, current_date):
 
     rank_map = dict((row["code"], idx + 1) for idx, row in enumerate(ranked))
     row_map = dict((row["code"], row) for row in ranked)
-    log("REBALANCE: candidates={} targets={} total_asset={:.2f} cash={:.2f} market={} asset_ok={}".format(
-        len(ranked), ",".join(target_codes), total_asset, cash, market_reason, asset_ok))
+    drift_values = []
+    for code in target_codes:
+        row = row_map.get(code)
+        if not row:
+            continue
+        current_value = int(positions.get(code, {}).get("total", 0)) * row["close"]
+        drift_values.append("{}:{:.2%}".format(code, current_value / total_asset - 1.0 / MAX_POSITIONS))
+    log("REBALANCE: candidates={} blocked={} targets={} total_asset={:.2f} cash={:.2f} market={} asset_ok={}".format(
+        len(ranked), format_blocked_counts(blocked_counts), ",".join(target_codes),
+        total_asset, cash, market_reason, asset_ok))
+    log("RANK TOP10: {}".format(format_ranked(ranked, 10)))
+    log("POSITION DRIFT: {}".format(",".join(drift_values) if drift_values else "NONE"))
 
     for code in target_codes:
         row = row_map.get(code)

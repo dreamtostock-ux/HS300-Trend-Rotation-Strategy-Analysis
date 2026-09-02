@@ -1,10 +1,10 @@
 [
   [
     "sh600930",
-    "too few rows: 276"
+    "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
   ],
   [
     "sz001280",
-    "too few rows: 182"
+    "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
   ]
 ]
