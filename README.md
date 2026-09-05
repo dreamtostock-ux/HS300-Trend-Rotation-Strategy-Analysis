@@ -28,7 +28,8 @@ Big-QMT built-in Python version of an HS300 trend rotation strategy.
 - Position ownership: stocks bought by the strategy remain managed even after index removal.
 - QMT compatibility: compact order remarks, odd-lot liquidation, retryable rejected/cancelled orders, and strategy-scoped order queries.
 - Logging: prints candidate counts, blocked-buy reasons, top rankings, targets, and position drift.
-- Sector fallback: if QMT does not return the HS300 sector list near the close, the strategy loads `hs300_constituents.csv` from the strategy directory.
+- Sector fallback: if QMT does not return the HS300 sector list, the strategy loads `hs300_constituents.csv` from an explicit path, the working directory, or common QMT `python` directories. It does not depend on `__file__`, which is absent in some big-QMT runtimes.
+- Error logging: repeated identical runtime failures are emitted at most once per minute instead of on every bar callback.
 
 ## Safety
 

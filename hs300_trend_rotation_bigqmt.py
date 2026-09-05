@@ -20,6 +20,7 @@ Safety:
 import json
 import math
 import os
+import sys
 from datetime import datetime
 
 
@@ -116,6 +117,8 @@ def new_state():
         "managed_codes": [],
         "pending_rebalance_date": "",
         "pending_targets": [],
+        "last_error_signature": "",
+        "last_error_time": "",
     }
 
 
@@ -127,6 +130,25 @@ S = new_state()
 def log(message):
     print("{} [{}] {}".format(
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), STRATEGY_NAME, message))
+
+
+def log_unexpected_error(exc):
+    """Log a repeated runtime failure at most once per minute."""
+    now = datetime.now()
+    signature = "{}: {}".format(type(exc).__name__, exc)
+    last_signature = S.get("last_error_signature", "")
+    last_text = S.get("last_error_time", "")
+    elapsed = None
+    if last_text:
+        try:
+            elapsed = (now - datetime.strptime(last_text, "%Y%m%d%H%M%S")).total_seconds()
+        except Exception:
+            elapsed = None
+    if signature == last_signature and elapsed is not None and elapsed < 60:
+        return
+    S["last_error_signature"] = signature
+    S["last_error_time"] = now.strftime("%Y%m%d%H%M%S")
+    log("UNEXPECTED ERROR: {}".format(signature))
 
 
 def current_account_id():
@@ -335,11 +357,19 @@ def load_fallback_constituents():
     candidates = []
     if FALLBACK_CONSTITUENTS_PATH:
         candidates.append(os.path.abspath(FALLBACK_CONSTITUENTS_PATH))
-    candidates.append(os.path.join(os.getcwd(), FALLBACK_CONSTITUENTS_FILE))
-    script_file = globals().get("__file__", "")
-    if script_file:
-        candidates.append(os.path.join(
-            os.path.dirname(os.path.abspath(script_file)), FALLBACK_CONSTITUENTS_FILE))
+    working_dir = os.path.abspath(os.getcwd())
+    runtime_dir = os.path.dirname(os.path.abspath(getattr(sys, "executable", "") or working_dir))
+    search_dirs = [
+        working_dir,
+        os.path.join(working_dir, "python"),
+        os.path.join(os.path.dirname(working_dir), "python"),
+        runtime_dir,
+        os.path.join(os.path.dirname(runtime_dir), "python"),
+    ]
+    if STATE_FILE:
+        search_dirs.append(os.path.dirname(STATE_FILE))
+    for directory in search_dirs:
+        candidates.append(os.path.join(directory, FALLBACK_CONSTITUENTS_FILE))
     checked = set()
     for path in candidates:
         path = os.path.normcase(os.path.abspath(path))
@@ -1250,7 +1280,7 @@ def handlebar(C):
     try:
         execute_strategy(C, account_id, current_date)
     except Exception as exc:
-        log("UNEXPECTED ERROR: {}".format(exc))
+        log_unexpected_error(exc)
 
 
 def order_callback(C, order_info):

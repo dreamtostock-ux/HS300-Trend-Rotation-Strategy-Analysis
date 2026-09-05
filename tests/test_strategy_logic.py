@@ -50,16 +50,24 @@ class StrategyLogicTests(unittest.TestCase):
         self.assertEqual(150, self.strategy.sell_lot(150))
         self.assertEqual(50, self.strategy.sell_lot(50))
 
-    def test_fallback_does_not_require_dunder_file(self):
+    def test_fallback_does_not_require_script_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "members.csv"
             path.write_text("code\n600000.SH\n000001.SZ\n", encoding="ascii")
             self.strategy.FALLBACK_CONSTITUENTS_PATH = str(path)
-            self.strategy.__dict__.pop("__file__", None)
             self.assertEqual(
                 ["600000.SH", "000001.SZ"],
                 self.strategy.load_fallback_constituents(),
             )
+        source = (ROOT / "hs300_trend_rotation_bigqmt.py").read_text(encoding="gbk")
+        self.assertNotIn("__" + "file__", source)
+
+    def test_repeated_runtime_errors_are_throttled(self):
+        messages = []
+        self.strategy.log = messages.append
+        self.strategy.log_unexpected_error(NameError("missing runtime name"))
+        self.strategy.log_unexpected_error(NameError("missing runtime name"))
+        self.assertEqual(1, len(messages))
 
     def test_backtest_mode_uses_bar_timestamp(self):
         class Context:
